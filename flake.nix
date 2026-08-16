@@ -26,8 +26,15 @@
           inherit system overlays;
         };
 
-        # Reads channel, components, and targets from rust-toolchain.toml.
-        rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
+        rustToolchain = pkgs.rust-bin.stable."1.71.0".default.override {
+          extensions = [
+            "rustfmt"
+            "clippy"
+            "rust-src"
+            "rust-docs"
+            "rust-analyzer"
+          ];
+        };
       in
       {
         devShells.default = pkgs.mkShell {
