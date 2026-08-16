@@ -1,0 +1,26 @@
+# Supply-chain policy for `cargo deny check`.
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+# Every licence actually present in the tree. Anything new has to be added
+# deliberately, which is the point of the list.
+allow = [
+  "Apache-2.0",
+  "BSL-1.0",
+  "MIT",
+  "Unicode-3.0",
+  "Unlicense",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,5 @@
+# Cargo gained an MSRV-aware resolver in 1.84. Without this, a `cargo update` run by a
+# newer toolchain would happily pick dependency versions that the pinned 1.74 compiler
+# cannot build. Cargo 1.74 itself ignores this key silently.
+[resolver]
+incompatible-rust-versions = "fallback"
