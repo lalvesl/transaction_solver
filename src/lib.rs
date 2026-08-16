@@ -1,9 +1,8 @@
 //! A toy payments engine.
 //!
-//! Input is validated at the boundary: an [`Amount`] or a [`Transaction`] can only be
-//! constructed from a well-formed record, so nothing further in ever has to re-check a
-//! value it was handed. [`Engine`] keeps one [`Account`] per client and applies those
-//! transactions.
+//! A CSV transaction log is streamed through [`pipeline::run`] into an [`Engine`], which
+//! keeps one [`Account`] per client. Once the input is exhausted, [`output::write`]
+//! renders the final balances.
 //!
 //! The design notes, and every assumption made where the specification was silent, are in
 //! the README.
@@ -12,8 +11,11 @@
 
 pub mod account;
 pub mod amount;
+pub mod cli;
 pub mod engine;
 pub mod error;
+pub mod output;
+pub mod pipeline;
 pub mod record;
 
 pub use account::Account;
