@@ -92,7 +92,18 @@ examples/
 tests/
   cli.rs       end-to-end tests against the real binary
   data/        sample inputs and their golden outputs
+
+nix/
+  rust.nix     the pinned toolchain, build platform, package and lints
+  bench.nix    the generator, the benchmark inputs and the runners
+
+bench/
+  history.jsonl  one record per benchmark run
 ```
+
+`flake.nix` is wiring only: it imports `nix/rust.nix` and `nix/bench.nix` and assembles
+their results into outputs, so the build definition and the benchmark definition can be
+read on their own.
 
 The generator is an example rather than a second `[[bin]]` on purpose: a crate with two
 binaries makes bare `cargo run` ambiguous, and the specification's `cargo run --
@@ -366,20 +377,29 @@ the specification asks about, and at this size a single-pass engine is the bette
 ## Benchmark
 
 ```console
-$ nix run .#bench
-$ BYTES=256MiB MIX=settled CLIENTS=1000 SEED=42 nix run .#bench
+$ nix run .#bench            # 1 GiB, balanced
+$ nix run .#bench-settled    # 1 GiB, settled
+$ nix run .#bench-small      # 16 MiB, what CI runs
 ```
 
-The benchmark generates its own input and times the engine against it. Defaults: seed
-`20260816`, 1 GiB, 65,535 clients, `balanced` mix. Generated files are cached under
-`BENCH_DIR` and keyed by their parameters, so re-running does not rebuild a gigabyte.
+**The input is a derivation, not a file in `/tmp`.** Each profile is a store path built by
+`nix build .#bench-input`, which means Nix knows it exists, rebuilds it when it is
+missing, and `nix store gc` reclaims the gigabyte once nothing references it. An earlier
+version generated into `$TMPDIR` from the runner script, which left a gigabyte somewhere
+Nix could neither guarantee nor collect. The runner also times the **packaged** binary —
+the one `nix build` produces — rather than whatever a local `cargo` last left in
+`./target`.
 
 **Reproducible by construction.** `examples/generate_transactions.rs` carries its own
 SplitMix64 instead of depending on a random-number crate, whose stream is free to change
-between releases. The same seed therefore produces byte-identical input on any machine, in
-any year — and a benchmark number is only comparable against another number measured on
-the same bytes. The run prints the SHA-256 of both the input and the output: the first
-confirms you measured the same bytes, the second that the engine reached the same answer.
+between releases. The same seed produces byte-identical input on any machine, in any year,
+and a benchmark number is only comparable against another measured on the same bytes.
+
+That is enforced rather than asserted for the small profile: `bench-input-small` is a
+fixed-output derivation with its hash pinned in `nix/bench.nix`, so Nix verifies the bytes
+after generating them and CI fails if the generator ever stops being deterministic. The
+1 GiB inputs deliberately leave the hash off, so that changing the generator does not
+break the build with a hash mismatch on a file that takes a minute to rebuild.
 
 The generator emits _valid_ work rather than noise. A dispute always names a real,
 currently-undisputed deposit belonging to that same client, and a resolve or chargeback
@@ -403,8 +423,8 @@ froze every account early would stop measuring anything.
 
 | Mix        | Records    | Wall   | Throughput               | Peak RSS | Rejected |
 | ---------- | ---------- | ------ | ------------------------ | -------- | -------- |
-| `balanced` | 34,531,441 | 25.9 s | 1.33M records/s, 41 MB/s | 762 MB   | 30,978   |
-| `settled`  | 40,589,904 | 36.1 s | 1.12M records/s, 30 MB/s | 257 MB   | 0        |
+| `balanced` | 34,531,441 | 26.7 s | 1.29M records/s, 40 MB/s | 762 MB   | 30,978   |
+| `settled`  | 40,589,904 | 31.9 s | 1.27M records/s, 34 MB/s | 257 MB   | 0        |
 
 Three things worth reading out of that table.
 
@@ -418,10 +438,14 @@ entry but not the table's capacity, so 257 MB is the high-water mark of concurre
 records rather than the current count. Removal prevents growth; only locking an account
 returns memory outright, by dropping the whole map.
 
-**Reference-heavy work is slower per record.** `settled` is about 16% slower per record
-than `balanced`: a dispute or resolve costs a hash lookup and a mutation on top of the
-parse, where most of `balanced` is parse-and-add. Its rows are also shorter, which is why
-the same gigabyte holds more of them.
+**Per-record cost barely moves between the two.** 1.29M against 1.27M records per second,
+about 2% apart, even though `settled` spends two thirds of its records on dispute and
+resolve lookups where `balanced` mostly parses and adds. The gap in MB/s is much wider —
+40 against 34 — but that is a property of the input, not the engine: reference rows carry
+no amount, so they are shorter, and the same gigabyte holds 18% more of them. An earlier
+measurement put `settled` 16% slower per record; re-running it against the store-built
+input did not reproduce that, so the honest reading is that the two are close and the
+first number was noise.
 
 The 30,978 rejections under `balanced` are almost all withdrawals refused for insufficient
 funds — the generator does not track balances, only references.
@@ -429,6 +453,25 @@ funds — the generator does not track balances, only references.
 The engine's own output is stable too: two runs over the same 1 GiB input produced the
 identical hash `80489f21…`, confirming that nothing about hash-map iteration order leaks
 into the result.
+
+### Metrics and history
+
+Each run reports wall time, user and system CPU, CPU utilisation, peak RSS, major and
+minor page faults, voluntary and involuntary context switches, and throughput in both
+records per second and MB/s.
+
+It then appends one JSON record to `bench/history.jsonl` — override with `BENCH_HISTORY` —
+and prints the delta against the previous run over the same input:
+
+```
+  vs previous  wall +9.7%, peak rss -3.2%
+```
+
+Every record carries the commit, the input's store path, the machine's core count and
+kernel, all of the metrics above, and the output's SHA-256. A regression can therefore be
+traced back to a commit, and a number measured on one machine is never silently compared
+against one measured on another. Because an input is identified by its store path, records
+for different profiles share one file without ambiguity.
 
 ---
 
@@ -565,7 +608,8 @@ The flake pins the toolchain, packages the engine, and carries the benchmark.
 | `nix build .#with-dispute-withdraw` | The same engine with withdrawal disputes compiled in.                                                                                                 |
 | `nix flake check`                   | Everything: both variants, the suite inside each, and the clippy, rustfmt and nixfmt checks. This is exactly what CI runs.                            |
 | `nix run . -- transactions.csv`     | Runs the packaged binary.                                                                                                                             |
-| `nix run .#bench`                   | The reproducible benchmark described below.                                                                                                           |
+| `nix run .#bench`                   | The reproducible 1 GiB benchmark described below. `.#bench-settled` and `.#bench-small` are the other profiles.                                       |
+| `nix build .#bench-input`           | Builds a benchmark input as a store path. `.#bench-input-settled`, `.#bench-input-small` and `.#bench-generator` are the rest.                        |
 | `nix develop`                       | Dev shell: the toolchain plus `cargo-nextest`, `cargo-mutants`, `cargo-deny` and the formatters.                                                      |
 | `nix run .#fmt`                     | Formats Rust, Nix, TOML and Markdown.                                                                                                                 |
 

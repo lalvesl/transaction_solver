@@ -60,12 +60,10 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      # 16 MiB rather than the 1 GiB default. The point is to prove the generator
+      # The 16 MiB input, not the 1 GiB default. The point is to prove the generator
       # and the benchmark wiring still work, not to measure anything: a shared CI
       # runner has too much variance to produce a number worth comparing, and the
-      # real 1 GiB run belongs on a known machine.
+      # real 1 GiB run belongs on a known machine. Building the input also verifies
+      # its pinned hash, so this doubles as a determinism check on the generator.
       - name: Generate and process a small input
-        env:
-          BYTES: 16MiB
-          CLIENTS: "256"
-        run: nix run .#bench
+        run: nix run .#bench-small
