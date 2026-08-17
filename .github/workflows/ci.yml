@@ -60,10 +60,12 @@ jobs:
           extra_nix_config: |
             experimental-features = nix-command flakes
 
-      # The 16 MiB input, not the 1 GiB default. The point is to prove the generator
-      # and the benchmark wiring still work, not to measure anything: a shared CI
-      # runner has too much variance to produce a number worth comparing, and the
-      # real 1 GiB run belongs on a known machine. Building the input also verifies
-      # its pinned hash, so this doubles as a determinism check on the generator.
+      # The 16 MiB input, not the 100M-record default. The point is to prove the
+      # generator and the benchmark wiring still work, not to measure anything: a
+      # shared CI runner has too much variance to produce a number worth comparing,
+      # and the real run belongs on a known machine. The runner's store is cold, so
+      # this also builds the input from scratch and verifies its pinned hash — on a
+      # different machine, with a different core count, which is exactly the case
+      # the pinned xz block size exists to survive.
       - name: Generate and process a small input
         run: nix run .#bench-small
