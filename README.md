@@ -579,6 +579,10 @@ two, on the reasoning that the reader and the writer are permanently busy stages
 should not be contending with the shards they feed. `--shards 1` is the sharding switched
 off, which is also what a single-core machine gets.
 
+On a single file the shard count barely matters — see
+[what the concurrency actually bought](#what-the-concurrency-actually-bought) for why that
+is a fact about one-producer input rather than about the sharding.
+
 **Why this is sound.** [D4](#d4-dispute-rows-must-match-the-transactions-own-client) is
 what makes it work: a dispute, resolve or chargeback is only valid when it names its own
 client's transaction, so account state partitions perfectly by client and no shard ever
@@ -624,9 +628,37 @@ coordination.
 That is Amdahl's law arriving exactly where it was expected. The reader parses every record
 before it can route it — routing needs the client ID, and the client ID has to be parsed
 out — so parsing is serial by construction, and it is the larger half of the work. Adding
-shards subdivides the smaller half. Getting more would mean parsing in the shards too,
-which means routing on a cheap pre-scan of the client field rather than on a parsed record.
-That is a real option and a bigger change; it is not in this PR.
+shards subdivides the smaller half. Getting more within this shape would mean parsing in
+the shards too, which means routing on a cheap pre-scan of the client field rather than on
+a parsed record. That is a real option and a bigger change; it is not in this PR.
+
+**But do not read that table as "one shard is enough".** It measures a workload with
+exactly one producer: a single file, read and parsed by a single thread. The shards are
+starved because there is one mouth feeding them, and that is a property of the benchmark,
+not of the design.
+
+The workload this is shaped for is the opposite. A server accepting partner connections has
+a reader per connection, so the producer side is already parallel — it scales with the
+number of sockets rather than being pinned at one. The serial half of the table simply is
+not serial there, and the shards stop being the underused stage and start being the one
+that has to keep up. That is when spreading accounts over several engines is doing work
+rather than paying coordination costs for 2%.
+
+Nothing needs redesigning to get there. `tokio`'s channel is multi-producer: more readers
+means more `Sender` clones onto the same shard channels, not a different architecture. What
+the shards require of a reader is only that one client's records arrive in order from it,
+which a single connection gives for free.
+
+The writer stays a single task on purpose, and that is a smaller concession than it looks
+under load. A server's steady-state output is a response per connection rather than one
+consolidated CSV; the one place a single serialised writer genuinely bites is the final
+drain, when every shard wants to hand over every account it holds at once — which is
+exactly why that drain is done one shard at a time.
+
+To be clear about what is measured and what is not: the table above is real, and the
+paragraphs about TCP are reasoning about a server that does not exist in this repository
+yet. They are the argument for keeping the sharding despite the 2%, not a second set of
+numbers.
 
 **Peak memory did not move, and the reason is worth stating plainly.** Evicting frozen
 accounts was expected to reduce it — 38,599 of 65,535 clients end frozen on this profile,
