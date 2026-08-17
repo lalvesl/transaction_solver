@@ -42,9 +42,11 @@ Amounts are always printed with exactly four decimal places. Since input amounts
 than four decimal places are rejected (see [D6](#d6-amounts-with-more-than-four-decimals-are-rejected)),
 this is pure formatting — no value is ever rounded on the way out.
 
-Rows are emitted in ascending client order. Ordering is explicitly irrelevant to the
-specification, but a deterministic output is what makes golden-file testing possible, and
-sorting at most 65,536 rows once, at the very end, costs nothing worth measuring.
+Rows are emitted in the order accounts finish, which is not client order and is not
+reproducible between runs — an account frozen by a chargeback is written the moment it
+freezes, and shards finish concurrently. Ordering is explicitly irrelevant to the
+specification; see [D13](#d13-output-rows-are-unordered) for what that traded away and what
+the tests check instead.
 
 ---
 
@@ -78,12 +80,14 @@ Undisputed ──dispute──> Disputed ──resolve────> Resolved    
 src/
   main.rs      CLI wiring: open the input, run the pipeline, write the accounts
   cli.rs       argument parsing
-  pipeline.rs  the streaming read loop, and where a rejected record is reported
+  pipeline.rs  the CSV reader, and the single-engine loop over it
+  parallel.rs  the sharded pipeline: one reader, N engines, one writer
+  route.rs     which shard owns a client
   record.rs    a CSV row, and the validated Transaction it becomes
   amount.rs    validated monetary amounts
-  engine.rs    routes a transaction to the account it belongs to
+  engine.rs    routes a transaction to the account it belongs to, and freezes clients
   account.rs   balances, disputable history, and every rule that moves money
-  output.rs    rendering the final accounts as CSV
+  output.rs    rendering account rows as CSV, streaming or sorted
   error.rs     RecordError (skip the record) and FatalError (stop the run)
 
 examples/
@@ -237,6 +241,38 @@ writes them in lower case and says nothing about capitalisation, but it does ins
 whitespace be tolerated, and the same reasoning applies: dropping a real movement of money
 over the case a partner happened to send is the worse failure. The comparison is ASCII and
 allocates nothing, so the leniency is free.
+
+### D12. A frozen client is evicted, not flagged
+
+A chargeback is terminal for the whole account
+([D3](#d3-a-locked-account-is-locked-for-everything)): nothing it holds can ever be read
+again. So the account does not stay in the table wearing a `locked` flag — it is removed,
+its row is written immediately, and the client ID goes into a `HashSet<u16>` so that every
+later record naming it can still be refused.
+
+The refusal is what makes this safe. Without the set, an evicted client would look like a
+client that had never been seen, and the next deposit would open a fresh account with a
+clean balance — turning a permanent freeze into a way to reset one. The set is the account's
+tombstone, and at two bytes per frozen client it is affordable for the entire key space.
+
+Being honest about the payoff: this was expected to cut peak memory and
+[does not](#what-the-concurrency-actually-bought), because the previous design already
+released the transaction history when it locked. What it buys is that a finished row leaves
+the process at the moment it is final, which is what a long-running server needs, and that a
+frozen client's residue is two bytes rather than an account.
+
+### D13. Output rows are unordered
+
+Rows used to be sorted by client, because sorting at most 65,536 of them at the end cost
+nothing and made golden-file testing trivial. Writing a frozen account the moment it freezes
+gives that up: rows arrive in completion order, and with shards running concurrently that
+order is not reproducible between runs.
+
+The specification is explicit that row order does not matter, so this trades a convenience
+for the streaming property. The tests were changed rather than the behaviour: they compare
+row _sets_ now, and separately assert that every client is written exactly once — which is
+the property an eviction scheme can actually get wrong, and which byte comparison never
+tested in the first place.
 
 ---
 
@@ -530,32 +566,107 @@ for different profiles share one file without ambiguity.
 
 ## Concurrency
 
-The engine is single-threaded. It is, however, deliberately structured so that scaling it
-to many concurrent streams is a wiring change rather than a rewrite:
+```text
+                    ┌──────────► shard 0 ─┐
+  input ── reader ──┼──────────► shard 1 ─┼──► writer ──► stdout
+ (blocking) parse   └──────────► shard N ─┘   (single)    stderr
+            route          mpsc<Batch>          mpsc<Out>
+```
 
-- The engine reads from any `impl Read`, not from a path — a file, a socket, or a
-  `Cursor` in a test are interchangeable.
-- All state lives inside the engine value. There are no globals, no statics, no shared
-  mutable state, and the engine is `Send`.
-- Input parsing and output rendering are separate from the state machine that applies
-  transactions, so a server would reuse the middle layer untouched.
+One thread reads and parses, `N` tokio tasks own disjoint sets of accounts, one task
+writes. `--shards` sets `N`; the default is two fewer than the available cores, floored at
+two, on the reasoning that the reader and the writer are permanently busy stages that
+should not be contending with the shards they feed. `--shards 1` is the sharding switched
+off, which is also what a single-core machine gets.
 
-To handle thousands of concurrent TCP streams, the natural shape is to shard by client:
-route each record to worker `hash(client) % N`. Per-account ordering — the one ordering
-guarantee that actually matters here, since the specification only promises chronological
-order within the file — is preserved automatically, because every transaction for a given
-client is handled by the same worker in arrival order. No cross-shard locking is needed.
+**Why this is sound.** [D4](#d4-dispute-rows-must-match-the-transactions-own-client) is
+what makes it work: a dispute, resolve or chargeback is only valid when it names its own
+client's transaction, so account state partitions perfectly by client and no shard ever
+reaches into another's. Routing is a pure function of the client ID, and a single reader
+feeding a FIFO channel keeps each account's records in arrival order — per-account
+ordering, the only ordering the semantics depend on, survives. Nothing is locked and
+nothing is shared.
 
-This works precisely because of [D4](#d4-dispute-rows-must-match-the-transactions-own-client):
-since a dispute is only valid when it names the transaction's own client, a shard never
-needs to reach a transaction belonging to another shard's client. The disputable history
-already lives inside each account, so it shards with them for free. Without that rule the
-history would have to be one shared, globally-locked index, and the sharding would buy
-much less.
+That is a claim worth testing rather than asserting: every sample runs at 1, 2, 3, 7 and 16
+shards and must produce the same rows, and the 100-million-record benchmark produces
+byte-identical output at 1, 2 and 6 shards.
 
-What is deliberately _not_ here: a thread pool or an async runtime. Both would add
-meaningful surface area to a program whose actual job is a state machine, and neither can
-be tested honestly against a single input file.
+**Routing.** `hash(client) % N` would leave shards idle for a partner that only sends even
+client IDs, so the client ID goes through a MurmurHash3 finaliser first, and the modulo is
+Lemire's multiply-shift rather than an actual division. The seed comes from `RandomState`,
+so the client-to-shard map differs every process: an attacker who could predict it could
+aim every record at one shard and serialise the whole pipeline. Note this is the realistic
+attack on a _router_ — collision-flooding does not apply, because there is no table here.
+The one table an attacker really can pick keys for is the per-client transaction map, keyed
+by a partner-chosen `u32`, and that one keeps the standard library's `SipHash`.
+
+**Shutdown, one shard at a time.** When the input ends the reader sends each shard a
+`Finish` command and waits for its acknowledgement before moving to the next. All shards
+could dump their accounts at once, but they would only queue behind a single writer that
+must serialise them anyway; draining one at a time keeps the writer's queue shallow.
+
+### What the concurrency actually bought
+
+100M records, balanced profile, 8 cores:
+
+| Shards          | Wall   | CPU    | Peak RSS |
+| --------------- | ------ | ------ | -------- |
+| before (serial) | 74.4 s | 72.5 s | 1913 MB  |
+| 1               | 48.3 s | 77.0 s | 1913 MB  |
+| 2               | 48.0 s | 78.7 s | 1915 MB  |
+| 6               | 47.3 s | 81.2 s | 1921 MB  |
+
+**Nearly all of the 35% win is the pipelining, not the sharding.** Splitting reading and
+parsing onto their own thread so they overlap with applying takes 74.4 s to 48.3 s at a
+single shard. Going from one shard to six then buys 2% more, for 4 extra CPU-seconds of
+coordination.
+
+That is Amdahl's law arriving exactly where it was expected. The reader parses every record
+before it can route it — routing needs the client ID, and the client ID has to be parsed
+out — so parsing is serial by construction, and it is the larger half of the work. Adding
+shards subdivides the smaller half. Getting more would mean parsing in the shards too,
+which means routing on a cheap pre-scan of the client field rather than on a parsed record.
+That is a real option and a bigger change; it is not in this PR.
+
+**Peak memory did not move, and the reason is worth stating plainly.** Evicting frozen
+accounts was expected to reduce it — 38,599 of 65,535 clients end frozen on this profile,
+so nearly 60% of the accounts leave early. It did not, because the previous code already
+released the transaction history on lock: `History::Locked` replaced the map with nothing.
+What eviction adds on top of that is the `Account` struct and its table entry, which is
+tens of bytes against the megabytes the history was already returning. Measured, 1913 MB
+both ways.
+
+So the eviction is not a memory optimisation for a batch run, and the README will not claim
+it is. What it is: rows leave the process as they finalise instead of at the end, and a
+frozen client costs two bytes in a `HashSet<u16>` rather than an account. Both matter for
+the long-running server this is shaped for, where "the end of the run" never comes.
+
+### SIMD, and a negative result
+
+Routing is batched — the reader stages a chunk of records, extracts the client IDs, and
+routes the whole chunk in one loop — and the loop is written for the auto-vectoriser:
+branch-free, no dependencies between lanes, uniform 32-bit arithmetic.
+
+**It does not vectorise.** Measured by reading the emitted assembly on rustc 1.74: scalar
+at `-C target-cpu=x86-64`, `x86-64-v2` and `x86-64-v3`, with and without LTO, fused and
+split into separate mixing and reducing passes, and with the input widened to `u32` so the
+loads and stores share a lane width. Four formulations, no vector register in any of them.
+
+Getting real SIMD from here means hand-written intrinsics, which need `unsafe`, and this
+crate is `#![forbid(unsafe_code)]` — that is a property worth more than this optimisation.
+The batching stays regardless, because it earns its keep elsewhere: it amortises the channel
+send across a thousand records rather than paying per record.
+
+And the cost deserves proportion. Routing is four arithmetic operations per record against
+roughly 750 ns of engine work. Vectorising it would be optimising the wrong three orders of
+magnitude.
+
+### Output order
+
+Accounts are written as they finish, so rows come out in completion order rather than
+client order, and with shards running concurrently that order varies between runs. The
+specification states row order is irrelevant; the tests compare row sets, and assert that
+every client appears exactly once whether it was evicted mid-run or drained at the end.
 
 ---
 
@@ -627,10 +738,16 @@ the dependencies:
 | `rust_decimal` | 1.42.1         | 1.64 | exact fixed-point money              |
 | `csv`          | 1.4.0          | 1.61 | streaming CSV reader and writer      |
 | `thiserror`    | 2.0.20         | 1.61 | error types                          |
+| `tokio`        | 1.53.1         | 1.70 | channels and the shard scheduler     |
 
-1.74 also sits comfortably inside the wider ecosystem's de-facto floor, so adding async
-I/O later would not force another jump. Holding that floor costs almost nothing here: as
-the table shows, every dependency still resolves to a current release.
+1.74 was chosen partly on the reasoning that it would not have to move again for async, and
+that held: `tokio` 1.53.1 resolves and builds on it unchanged. It arrives with two
+transitive crates — `tokio-macros` and `pin-project-lite` — and `cargo deny` passes on
+advisories, bans, licences and sources.
+
+Only `rt-multi-thread`, `sync` and `macros` are enabled. No `net`, no `fs`, no `time`: the
+runtime is here for its scheduler and its channels, and nothing in this program waits on a
+socket or a clock. The runtime is even built without the I/O driver for that reason.
 
 ### Why `Cargo.lock` is committed
 

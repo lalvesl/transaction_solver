@@ -4,35 +4,62 @@ use std::io::Write;
 
 use rust_decimal::Decimal;
 
-use crate::{account::Account, amount::SCALE, engine::Engine, error::FatalError};
+use crate::{account::AccountRow, amount::SCALE, error::FatalError};
 
-/// Writes every account as a CSV row.
+/// Writes account rows as they arrive.
 ///
-/// Row order is irrelevant to the specification, but sorting by client makes the output
-/// deterministic, which is what allows the integration tests to compare against committed
-/// golden files. With at most 65,536 accounts the sort is free.
-pub fn write<W: Write>(engine: &Engine, writer: W) -> Result<(), FatalError> {
-    let mut csv = csv::Writer::from_writer(writer);
+/// Rows are written the moment they are handed over, which is what lets a frozen account
+/// leave the engine mid-run instead of being carried to the end. The consequence is that
+/// output order follows the order accounts finish in, not client order: with shards
+/// running concurrently that order is not reproducible between runs. The specification
+/// states row order is irrelevant, and the tests compare row sets rather than bytes.
+pub struct RowWriter<W: Write> {
+    csv: csv::Writer<W>,
+}
 
-    csv.write_record(["client", "available", "held", "total", "locked"])
-        .map_err(FatalError::Write)?;
-
-    let mut accounts: Vec<&Account> = engine.accounts().collect();
-    accounts.sort_unstable_by_key(|account| account.client());
-
-    for account in accounts {
-        csv.write_record([
-            account.client().to_string(),
-            render(account.available()),
-            render(account.held()),
-            render(account.total()),
-            account.is_locked().to_string(),
-        ])
-        .map_err(FatalError::Write)?;
+impl<W: Write> RowWriter<W> {
+    /// Opens the output and writes the header.
+    pub fn new(writer: W) -> Result<Self, FatalError> {
+        let mut csv = csv::Writer::from_writer(writer);
+        csv.write_record(["client", "available", "held", "total", "locked"])
+            .map_err(FatalError::Write)?;
+        Ok(Self { csv })
     }
 
-    csv.flush()
-        .map_err(|error| FatalError::Write(csv::Error::from(error)))
+    /// Writes one row.
+    pub fn write(&mut self, row: AccountRow) -> Result<(), FatalError> {
+        self.csv
+            .write_record([
+                row.client.to_string(),
+                render(row.available),
+                render(row.held),
+                render(row.total),
+                row.locked.to_string(),
+            ])
+            .map_err(FatalError::Write)
+    }
+
+    /// Flushes everything buffered.
+    pub fn finish(mut self) -> Result<(), FatalError> {
+        self.csv
+            .flush()
+            .map_err(|error| FatalError::Write(csv::Error::from(error)))
+    }
+}
+
+/// Writes a finished set of rows, in ascending client order.
+///
+/// Used by the single-threaded path, where every row is in hand at the end anyway and
+/// sorting 65,536 of them costs nothing.
+pub fn write<W: Write>(rows: Vec<AccountRow>, writer: W) -> Result<(), FatalError> {
+    let mut rows = rows;
+    rows.sort_unstable_by_key(|row| row.client);
+
+    let mut out = RowWriter::new(writer)?;
+    for row in rows {
+        out.write(row)?;
+    }
+    out.finish()
 }
 
 /// Formats a balance with exactly [`SCALE`] decimal places.
@@ -57,15 +84,15 @@ mod tests {
     use std::str::FromStr;
 
     use super::*;
-    use crate::{amount::Amount, record::Transaction};
+    use crate::{amount::Amount, engine::Engine, record::Transaction};
 
     fn dec(raw: &str) -> Decimal {
         Decimal::from_str(raw).expect("valid decimal")
     }
 
-    fn rendered(engine: &Engine) -> String {
+    fn rendered(engine: &mut Engine) -> String {
         let mut buffer = Vec::new();
-        write(engine, &mut buffer).expect("writing to a Vec cannot fail");
+        write(engine.drain_rows(), &mut buffer).expect("writing to a Vec cannot fail");
         String::from_utf8(buffer).expect("output is ASCII")
     }
 
@@ -86,7 +113,7 @@ mod tests {
     #[test]
     fn writes_a_header_even_with_no_accounts() {
         assert_eq!(
-            rendered(&Engine::new()),
+            rendered(&mut Engine::new()),
             "client,available,held,total,locked\n"
         );
     }
@@ -105,7 +132,7 @@ mod tests {
         }
 
         assert_eq!(
-            rendered(&engine),
+            rendered(&mut engine),
             "client,available,held,total,locked\n\
              1,1.0000,0.0000,1.0000,false\n\
              5,1.0000,0.0000,1.0000,false\n\

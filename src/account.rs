@@ -27,16 +27,24 @@ struct TxRecord {
     state: TxState,
 }
 
+/// Keyed by a `u32` an untrusted partner chooses, so this map keeps the standard library's
+/// randomly seeded `SipHash`: it is the one table in the engine an attacker could try to
+/// fill with colliding keys. The client table cannot be attacked that way — `u16` bounds it
+/// at 65,536 entries — and [`crate::route`] hashes client IDs with something far cheaper.
 type TxHistory = HashMap<u32, TxRecord>;
 
-/// The disputable history of an account.
+/// A finished account, ready to be written.
 ///
-/// A locked account can never move again, so locking replaces the map with nothing and
-/// hands its memory back rather than carrying a dead index for the rest of the run.
-#[derive(Debug)]
-enum History {
-    Open(TxHistory),
-    Locked,
+/// Frozen accounts leave the engine the moment they freeze, so their row is produced there
+/// rather than at the end of the run. A row owns its numbers and borrows nothing, which is
+/// what lets one shard hand it to the writer task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountRow {
+    pub client: u16,
+    pub available: Decimal,
+    pub held: Decimal,
+    pub total: Decimal,
+    pub locked: bool,
 }
 
 /// A client account.
@@ -50,7 +58,7 @@ pub struct Account {
     client: u16,
     available: Decimal,
     held: Decimal,
-    history: History,
+    txs: TxHistory,
 }
 
 impl Account {
@@ -60,7 +68,21 @@ impl Account {
             client,
             available: Decimal::ZERO,
             held: Decimal::ZERO,
-            history: History::Open(TxHistory::new()),
+            txs: TxHistory::new(),
+        }
+    }
+
+    /// This account as an output row.
+    ///
+    /// `locked` is passed in rather than read off the account: freezing is the engine's
+    /// business now, because a frozen account is not kept here to be asked.
+    pub fn row(&self, locked: bool) -> AccountRow {
+        AccountRow {
+            client: self.client,
+            available: self.available,
+            held: self.held,
+            total: self.total(),
+            locked,
         }
     }
 
@@ -85,13 +107,9 @@ impl Account {
         self.available.saturating_add(self.held)
     }
 
-    pub fn is_locked(&self) -> bool {
-        matches!(self.history, History::Locked)
-    }
-
     /// Credits the account and retains the transaction for later dispute.
     pub fn deposit(&mut self, tx: u32, amount: Amount) -> Result<(), RecordError> {
-        if self.open_txs()?.contains_key(&tx) {
+        if self.txs.contains_key(&tx) {
             return Err(RecordError::DuplicateTx {
                 client: self.client,
                 tx,
@@ -100,7 +118,7 @@ impl Account {
 
         let available = self.add(self.available, amount.value())?;
         self.set_balances(available, self.held)?;
-        self.open_txs()?.insert(
+        self.txs.insert(
             tx,
             TxRecord {
                 amount,
@@ -112,10 +130,8 @@ impl Account {
 
     /// Debits the account, if it can cover the amount.
     pub fn withdraw(&mut self, tx: u32, amount: Amount) -> Result<(), RecordError> {
-        self.open_txs()?;
-
         #[cfg(feature = "dispute-withdraw")]
-        if self.open_txs()?.contains_key(&tx) {
+        if self.txs.contains_key(&tx) {
             return Err(RecordError::DuplicateTx {
                 client: self.client,
                 tx,
@@ -134,7 +150,7 @@ impl Account {
         self.set_balances(available, self.held)?;
 
         #[cfg(feature = "dispute-withdraw")]
-        self.open_txs()?.insert(
+        self.txs.insert(
             tx,
             TxRecord {
                 amount,
@@ -202,7 +218,7 @@ impl Account {
 
         self.set_balances(available, held)?;
         // Resolved is terminal, so the record is dropped rather than kept forever.
-        self.open_txs()?.remove(&tx);
+        self.txs.remove(&tx);
         Ok(())
     }
 
@@ -228,23 +244,14 @@ impl Account {
         };
 
         self.set_balances(available, held)?;
-        // Nothing can move on this account again, so the history is released.
-        self.history = History::Locked;
+        // The caller freezes the client and drops this account, which releases the
+        // history with it. Nothing here can ever be read again.
         Ok(())
-    }
-
-    /// The disputable history, or an error if the account is frozen.
-    fn open_txs(&mut self) -> Result<&mut TxHistory, RecordError> {
-        let client = self.client;
-        match &mut self.history {
-            History::Open(txs) => Ok(txs),
-            History::Locked => Err(RecordError::AccountLocked(client)),
-        }
     }
 
     fn record(&mut self, tx: u32) -> Result<TxRecord, RecordError> {
         let client = self.client;
-        self.open_txs()?
+        self.txs
             .get(&tx)
             .copied()
             .ok_or(RecordError::UnknownTx { client, tx })
@@ -252,7 +259,7 @@ impl Account {
 
     fn record_mut(&mut self, tx: u32) -> Result<&mut TxRecord, RecordError> {
         let client = self.client;
-        self.open_txs()?
+        self.txs
             .get_mut(&tx)
             .ok_or(RecordError::UnknownTx { client, tx })
     }
@@ -356,16 +363,17 @@ mod tests {
         account.dispute(1).expect("dispute");
         account.resolve(1).expect("resolve");
         assert_balances(&account, "5", "0");
-        assert!(!account.is_locked());
     }
 
+    /// Freezing itself belongs to the engine, which evicts the account: see
+    /// `engine::tests::a_chargeback_evicts_the_account`. What the account owes is the
+    /// reversal.
     #[test]
-    fn chargeback_removes_the_funds_and_locks() {
+    fn chargeback_removes_the_funds() {
         let mut account = funded(1, 1, "5");
         account.dispute(1).expect("dispute");
         account.chargeback(1).expect("chargeback");
         assert_balances(&account, "0", "0");
-        assert!(account.is_locked());
     }
 
     #[test]
@@ -381,35 +389,9 @@ mod tests {
         assert_eq!(account.total(), dec("-5"));
     }
 
-    #[test]
-    fn a_locked_account_rejects_everything() {
-        let mut account = funded(1, 1, "5");
-        account.deposit(2, amount("5")).expect("second deposit");
-        account.dispute(1).expect("dispute");
-        account.dispute(2).expect("second dispute");
-        account.chargeback(1).expect("chargeback");
-
-        assert!(matches!(
-            account.deposit(3, amount("1")),
-            Err(RecordError::AccountLocked(1))
-        ));
-        assert!(matches!(
-            account.withdraw(4, amount("1")),
-            Err(RecordError::AccountLocked(1))
-        ));
-        assert!(matches!(
-            account.dispute(2),
-            Err(RecordError::AccountLocked(1))
-        ));
-        assert!(matches!(
-            account.resolve(2),
-            Err(RecordError::AccountLocked(1))
-        ));
-        assert!(matches!(
-            account.chargeback(2),
-            Err(RecordError::AccountLocked(1))
-        ));
-    }
+    // D3 — a frozen client rejects everything — is now enforced one level up, because a
+    // frozen account is not kept here to reject anything. See
+    // `engine::tests::a_frozen_client_rejects_everything`.
 
     #[test]
     fn funds_held_when_the_account_locks_stay_held() {
@@ -516,7 +498,6 @@ mod tests {
         account.dispute(2).expect("dispute");
         account.resolve(2).expect("resolve");
         assert_balances(&account, "0", "0");
-        assert!(!account.is_locked());
     }
 
     #[cfg(feature = "dispute-withdraw")]
@@ -528,6 +509,5 @@ mod tests {
         account.chargeback(2).expect("chargeback");
         assert_balances(&account, "5", "0");
         assert_eq!(account.total(), dec("5"));
-        assert!(account.is_locked());
     }
 }

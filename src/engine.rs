@@ -1,17 +1,26 @@
 //! Routes transactions to the account they belong to.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use crate::{account::Account, error::RecordError, record::Transaction};
+use crate::{
+    account::{Account, AccountRow},
+    error::RecordError,
+    record::Transaction,
+};
 
 /// Every client account seen so far.
 ///
 /// All state lives in this value: no globals, no statics, nothing shared. Two engines can
-/// run side by side on separate inputs, which is what makes the sharding sketched in the
-/// README a wiring change rather than a rewrite.
+/// run side by side on separate inputs, which is what lets [`crate::parallel`] give each
+/// shard its own and never synchronise between them.
 #[derive(Debug)]
 pub struct Engine {
     clients: HashMap<u16, Account>,
+    /// Clients frozen by a chargeback. Their accounts are gone; only the ID remains, so
+    /// that every later record naming them can still be refused.
+    frozen: HashSet<u16>,
+    /// Rows of accounts already evicted, waiting to be taken by the caller.
+    evicted: Vec<AccountRow>,
 }
 
 impl Engine {
@@ -21,13 +30,30 @@ impl Engine {
     /// Allocating it once costs a fixed few megabytes and buys a run with no rehashing:
     /// no growth spikes, and no per-record chance of paying for a table copy.
     pub fn new() -> Self {
+        Self::with_capacity(u16::MAX as usize)
+    }
+
+    /// A new engine sized for `clients` accounts.
+    ///
+    /// A shard owns roughly `65,536 / shards` of the key space, so pre-sizing every shard
+    /// for the whole of it would multiply the fixed cost by the shard count for no reason.
+    pub fn with_capacity(clients: usize) -> Self {
         Self {
-            clients: HashMap::with_capacity(u16::MAX as usize),
+            clients: HashMap::with_capacity(clients),
+            frozen: HashSet::new(),
+            evicted: Vec::new(),
         }
     }
 
     /// Applies one transaction.
     pub fn apply(&mut self, transaction: Transaction) -> Result<(), RecordError> {
+        // A frozen account is refused before anything else looks at it. This is the only
+        // place that still knows the client existed: the account itself is long gone.
+        let client = transaction.client();
+        if self.frozen.contains(&client) {
+            return Err(RecordError::AccountLocked(client));
+        }
+
         match transaction {
             Transaction::Deposit { client, tx, amount } => self.opened(client).deposit(tx, amount),
             Transaction::Withdrawal { client, tx, amount } => {
@@ -35,8 +61,47 @@ impl Engine {
             }
             Transaction::Dispute { client, tx } => self.existing(client, tx)?.dispute(tx),
             Transaction::Resolve { client, tx } => self.existing(client, tx)?.resolve(tx),
-            Transaction::Chargeback { client, tx } => self.existing(client, tx)?.chargeback(tx),
+            Transaction::Chargeback { client, tx } => {
+                self.existing(client, tx)?.chargeback(tx)?;
+                self.freeze(client);
+                Ok(())
+            }
         }
+    }
+
+    /// Rows for accounts frozen since this was last called.
+    ///
+    /// Draining rather than reading: a frozen account's row is final, so the caller can
+    /// write it and forget it. This is what keeps peak memory tied to the accounts still
+    /// in play rather than to every account the run has ever touched.
+    pub fn take_evicted(&mut self) -> std::vec::Drain<'_, AccountRow> {
+        self.evicted.drain(..)
+    }
+
+    /// Every row the engine still owes: whatever `take_evicted` has not taken, followed by
+    /// the accounts still open. Leaves the engine empty.
+    pub fn drain_rows(&mut self) -> Vec<AccountRow> {
+        let mut rows: Vec<AccountRow> = self.evicted.drain(..).collect();
+        rows.extend(self.clients.drain().map(|(_, account)| account.row(false)));
+        rows
+    }
+
+    /// True once a chargeback has frozen this client.
+    pub fn is_frozen(&self, client: u16) -> bool {
+        self.frozen.contains(&client)
+    }
+
+    /// Freezes a client and evicts its account.
+    ///
+    /// A chargeback is terminal for the whole account, so nothing it holds can be read
+    /// again: the account leaves the table along with its entire transaction history, and
+    /// what stays behind is two bytes in a set. On the `settled` benchmark profile the
+    /// history is the memory — this is the only path that returns it outright.
+    fn freeze(&mut self, client: u16) {
+        if let Some(account) = self.clients.remove(&client) {
+            self.evicted.push(account.row(true));
+        }
+        self.frozen.insert(client);
     }
 
     /// Every account, in no particular order.
@@ -147,6 +212,89 @@ mod tests {
         }
         assert!(engine.account(7).is_none());
         assert_eq!(engine.accounts().count(), 0);
+    }
+
+    fn chargeback(client: u16, tx: u32) -> Transaction {
+        Transaction::Chargeback { client, tx }
+    }
+
+    /// Drives a client to a chargeback and returns the engine holding the aftermath.
+    fn frozen(client: u16) -> Engine {
+        let mut engine = Engine::new();
+        engine.apply(deposit(client, 1, "5.0")).expect("deposit");
+        engine
+            .apply(Transaction::Dispute { client, tx: 1 })
+            .expect("dispute");
+        engine.apply(chargeback(client, 1)).expect("chargeback");
+        engine
+    }
+
+    #[test]
+    fn a_chargeback_evicts_the_account() {
+        let mut engine = frozen(1);
+
+        assert!(engine.is_frozen(1));
+        assert!(
+            engine.account(1).is_none(),
+            "the account and its history should be gone, not merely flagged"
+        );
+
+        let evicted: Vec<_> = engine.take_evicted().collect();
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].client, 1);
+        assert!(evicted[0].locked);
+        assert_eq!(evicted[0].total, Decimal::ZERO);
+    }
+
+    /// D3: the freeze covers every kind of record, not just the money-moving ones.
+    #[test]
+    fn a_frozen_client_rejects_everything() {
+        let mut engine = frozen(1);
+
+        for transaction in [
+            deposit(1, 2, "1.0"),
+            withdrawal(1, 3, "1.0"),
+            Transaction::Dispute { client: 1, tx: 1 },
+            Transaction::Resolve { client: 1, tx: 1 },
+            chargeback(1, 1),
+        ] {
+            assert!(
+                matches!(
+                    engine.apply(transaction),
+                    Err(RecordError::AccountLocked(1))
+                ),
+                "a frozen client must refuse every record"
+            );
+        }
+
+        assert!(
+            engine.account(1).is_none(),
+            "a refused record must not resurrect the account"
+        );
+    }
+
+    /// A row is produced once and only once, whether the account froze mid-run or survived
+    /// to the end.
+    #[test]
+    fn every_client_is_reported_exactly_once() {
+        let mut engine = frozen(1);
+        engine.apply(deposit(2, 9, "3.0")).expect("deposit");
+
+        let taken: Vec<_> = engine.take_evicted().collect();
+        let remaining = engine.drain_rows();
+
+        let mut clients: Vec<u16> = taken
+            .iter()
+            .chain(remaining.iter())
+            .map(|row| row.client)
+            .collect();
+        clients.sort_unstable();
+
+        assert_eq!(clients, vec![1, 2]);
+        assert!(
+            engine.drain_rows().is_empty(),
+            "draining twice must be empty"
+        );
     }
 
     #[test]
