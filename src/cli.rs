@@ -11,6 +11,6 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub struct Cli {
-    /// CSV file of transactions to process.
-    pub input: PathBuf,
+    /// CSV file of transactions to process. Reads from standard input if omitted or `-`.
+    pub input: Option<PathBuf>,
 }

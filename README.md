@@ -8,10 +8,10 @@ states to stdout as CSV.
 
 ```console
 $ cargo run --release -- transactions.csv > accounts.csv
+$ cat transactions.csv | cargo run --release > accounts.csv
 ```
 
-The input file is the first and only argument. The result goes to **stdout**; every
-diagnostic goes to **stderr**, so redirecting stdout always yields a clean CSV.
+Transactions can be read from a file path argument or from **stdin** (if no argument is provided or `-` is specified). The result goes to **stdout**; every diagnostic goes to **stderr**, so redirecting stdout always yields a clean CSV.
 
 ---
 

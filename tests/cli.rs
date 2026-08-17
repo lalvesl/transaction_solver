@@ -159,11 +159,58 @@ fn a_missing_input_file_is_fatal() {
 }
 
 #[test]
-fn the_input_path_is_required() {
-    let output = Command::new(env!("CARGO_BIN_EXE_transaction_solver"))
-        .output()
+fn reads_from_stdin_when_no_argument_given() {
+    let input_bytes = std::fs::read(data_dir().join("spec_example.csv")).expect("read sample");
+    let expected =
+        std::fs::read_to_string(data_dir().join("spec_example.expected")).expect("read expected");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_transaction_solver"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("the binary should be runnable");
 
-    assert!(!output.status.success());
-    assert!(stdout_of(&output).is_empty());
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("stdin handle");
+        stdin.write_all(&input_bytes).expect("write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("wait for output");
+    assert!(
+        output.status.success(),
+        "should exit successfully, stderr:\n{}",
+        stderr_of(&output)
+    );
+    assert_eq!(stdout_of(&output), expected);
+}
+
+#[test]
+fn reads_from_stdin_when_dash_argument_given() {
+    let input_bytes = std::fs::read(data_dir().join("spec_example.csv")).expect("read sample");
+    let expected =
+        std::fs::read_to_string(data_dir().join("spec_example.expected")).expect("read expected");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_transaction_solver"))
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the binary should be runnable");
+
+    {
+        use std::io::Write;
+        let mut stdin = child.stdin.take().expect("stdin handle");
+        stdin.write_all(&input_bytes).expect("write to stdin");
+    }
+
+    let output = child.wait_with_output().expect("wait for output");
+    assert!(
+        output.status.success(),
+        "should exit successfully, stderr:\n{}",
+        stderr_of(&output)
+    );
+    assert_eq!(stdout_of(&output), expected);
 }

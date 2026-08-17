@@ -1,7 +1,8 @@
 use std::{
     error::Error,
     fs::File,
-    io::{self, BufWriter, Write},
+    io::{self, BufWriter, Read, Write},
+    path::Path,
     process::ExitCode,
 };
 
@@ -21,10 +22,15 @@ fn main() -> ExitCode {
 fn try_main() -> Result<(), FatalError> {
     let cli = Cli::parse();
 
-    let input = File::open(&cli.input).map_err(|source| FatalError::Open {
-        path: cli.input.clone(),
-        source,
-    })?;
+    let input: Box<dyn Read> = match cli.input.as_deref() {
+        Some(path) if path != Path::new("-") => {
+            Box::new(File::open(path).map_err(|source| FatalError::Open {
+                path: path.to_path_buf(),
+                source,
+            })?)
+        }
+        _ => Box::new(io::stdin()),
+    };
 
     let mut engine = Engine::new();
     let mut diagnostics = BufWriter::new(io::stderr());
