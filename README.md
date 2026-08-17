@@ -611,19 +611,28 @@ must serialise them anyway; draining one at a time keeps the writer's queue shal
 
 ### What the concurrency actually bought
 
-100M records, balanced profile, 8 cores:
+100M records, balanced profile, 8 cores. Best of three runs per configuration — this
+machine is not otherwise idle, and single runs of the same binary on the same input have
+come out as much as 40% apart when something else wanted the cores. The minimum is the
+least contaminated estimator available here; treat differences under about 3% as nothing.
 
 | Shards          | Wall   | CPU    | Peak RSS |
 | --------------- | ------ | ------ | -------- |
-| before (serial) | 74.4 s | 72.5 s | 1913 MB  |
-| 1               | 48.3 s | 77.0 s | 1913 MB  |
-| 2               | 48.0 s | 78.7 s | 1915 MB  |
-| 6               | 47.3 s | 81.2 s | 1921 MB  |
+| before (serial) | 70.0 s | 68.6 s | 1910 MB  |
+| 1               | 44.3 s | 71.3 s | 1915 MB  |
+| 2               | 46.1 s | 75.8 s | 1919 MB  |
+| 6               | 45.1 s | 79.9 s | 1920 MB  |
 
-**Nearly all of the 35% win is the pipelining, not the sharding.** Splitting reading and
-parsing onto their own thread so they overlap with applying takes 74.4 s to 48.3 s at a
-single shard. Going from one shard to six then buys 2% more, for 4 extra CPU-seconds of
-coordination.
+**The entire 37% win is the pipelining. The sharding contributes nothing.** Splitting
+reading and parsing onto their own thread so they overlap with applying takes 70.0 s to
+44.3 s at a single shard. Adding shards from there does not improve wall time at all — 44,
+46 and 45 seconds are the same number at this precision, and one shard is nominally the
+fastest of the three.
+
+The cost, however, is not noise. CPU rises monotonically with the shard count — 71.3, 75.8,
+79.9 seconds — which is well outside the run-to-run spread and is exactly what more channel
+traffic and more scheduler work should look like. Sharding this workload buys no time and
+burns 12% more CPU to do it.
 
 That is Amdahl's law arriving exactly where it was expected. The reader parses every record
 before it can route it — routing needs the client ID, and the client ID has to be parsed
@@ -657,8 +666,8 @@ exactly why that drain is done one shard at a time.
 
 To be clear about what is measured and what is not: the table above is real, and the
 paragraphs about TCP are reasoning about a server that does not exist in this repository
-yet. They are the argument for keeping the sharding despite the 2%, not a second set of
-numbers.
+yet. They are the argument for keeping the sharding despite it costing more than it returns
+here, not a second set of numbers.
 
 **Peak memory did not move, and the reason is worth stating plainly.** Evicting frozen
 accounts was expected to reduce it — 38,599 of 65,535 clients end frozen on this profile,

@@ -55,17 +55,23 @@ use crate::{
     route::Router,
 };
 
-/// How many records a shard receives per message.
+/// The most records one message to a shard may carry.
 ///
-/// Large enough that the per-message cost of the channel disappears against the work, small
-/// enough that a shard yields to the runtime often and that an in-flight batch is a
-/// negligible amount of memory.
+/// A ceiling, not a quota. Messages are whatever size the reader had ready — one record is
+/// a perfectly good message — and this only caps the other end, so that a chunk routing
+/// mostly to one shard is split instead of arriving as a single oversized message.
+///
+/// Nothing is ever held back to reach this number. Waiting to top a batch up would trade
+/// latency for a marginally larger message, and for a reader that delivers one request at a
+/// time — a socket rather than a file — the top-up might be seconds away, or never.
 const BATCH: usize = 1024;
 
-/// How many records the reader stages before routing them.
+/// How many records this reader stages before routing them.
 ///
-/// Routing a chunk at a time amortises the channel send and keeps the routing loop in one
-/// place; see `route` for what that did and did not buy.
+/// Routing a chunk at a time amortises the work of the routing loop; see `route` for what
+/// that did and did not buy. It is a property of *this* reader, not of the protocol: a
+/// reader fed one request at a time would stage one and flush it, and the shards would not
+/// know the difference.
 const CHUNK: usize = 4096;
 
 /// How many batches may be queued to one shard before the reader blocks.
@@ -167,7 +173,8 @@ fn read_into(
     let mut staged: Vec<Entry> = Vec::with_capacity(CHUNK);
     let mut clients: Vec<u32> = Vec::with_capacity(CHUNK);
     let mut targets: Vec<u32> = vec![0; CHUNK];
-    let mut batches: Vec<Vec<Entry>> = (0..shards).map(|_| Vec::with_capacity(BATCH)).collect();
+    let hint = batch_hint(shards);
+    let mut batches: Vec<Vec<Entry>> = (0..shards).map(|_| Vec::with_capacity(hint)).collect();
 
     // Even a stream that cannot be opened has to fall through to the shutdown below, or
     // the shards would wait for a `Finish` that never comes.
@@ -205,10 +212,13 @@ fn read_into(
                 &mut batches,
                 senders,
                 router,
+                hint,
             );
         }
     }
 
+    // `flush_chunk` leaves nothing behind, so the tail of the input needs no separate
+    // drain of the per-shard buffers.
     flush_chunk(
         &mut staged,
         &mut clients,
@@ -216,10 +226,8 @@ fn read_into(
         &mut batches,
         senders,
         router,
+        hint,
     );
-    for (shard, batch) in batches.iter_mut().enumerate() {
-        send(&senders[shard], std::mem::take(batch));
-    }
 
     // One shard at a time: see the module docs.
     for sender in senders {
@@ -241,6 +249,7 @@ fn flush_chunk(
     batches: &mut [Vec<Entry>],
     senders: &[mpsc::Sender<Batch>],
     router: Router,
+    hint: usize,
 ) {
     if staged.is_empty() {
         return;
@@ -257,11 +266,37 @@ fn flush_chunk(
     for (entry, &target) in staged.drain(..).zip(targets.iter()) {
         let shard = target as usize;
         batches[shard].push(entry);
+        // BATCH is a ceiling, not a quota. A chunk whose clients happen to route mostly to
+        // one shard is split here rather than sent as one oversized message.
         if batches[shard].len() == BATCH {
-            send(&senders[shard], std::mem::take(&mut batches[shard]));
-            batches[shard] = Vec::with_capacity(BATCH);
+            send(
+                &senders[shard],
+                std::mem::replace(&mut batches[shard], Vec::with_capacity(hint)),
+            );
         }
     }
+
+    // Everything the chunk produced goes out now, at whatever size it came to. Holding a
+    // partial batch back to top it up from the next chunk would trade latency for a
+    // marginally larger message, and under a reader that delivers one record at a time
+    // that trade never pays off — the top-up may be a long time coming.
+    for (shard, batch) in batches.iter_mut().enumerate() {
+        if !batch.is_empty() {
+            send(
+                &senders[shard],
+                std::mem::replace(batch, Vec::with_capacity(hint)),
+            );
+        }
+    }
+}
+
+/// How large a per-shard batch buffer to allocate.
+///
+/// An even split of a chunk, capped by [`BATCH`] and never zero. Sizing it to what a chunk
+/// actually produces avoids reserving a full `BATCH` for every shard on every chunk when
+/// the split means each will only see a fraction of that.
+fn batch_hint(shards: usize) -> usize {
+    (CHUNK / shards.max(1)).clamp(1, BATCH)
 }
 
 /// Sends a batch, ignoring a shard that has already gone away.
@@ -367,5 +402,26 @@ mod tests {
     fn a_single_core_turns_sharding_off() {
         assert_eq!(shards_for(1), 1);
         assert_eq!(shards_for(0), 1);
+    }
+
+    #[test]
+    fn the_batch_buffer_is_sized_for_a_shards_share_of_a_chunk() {
+        assert_eq!(batch_hint(4), CHUNK / 4);
+        assert_eq!(batch_hint(6), CHUNK / 6);
+    }
+
+    /// One shard sees the whole chunk, so the buffer is capped rather than sized at 4096.
+    #[test]
+    fn the_batch_buffer_never_exceeds_the_message_ceiling() {
+        assert_eq!(batch_hint(1), BATCH);
+        assert!(batch_hint(2) <= BATCH);
+    }
+
+    /// More shards than a chunk has records still has to ask for a usable buffer, not one
+    /// of length zero.
+    #[test]
+    fn the_batch_buffer_is_never_empty() {
+        assert_eq!(batch_hint(CHUNK * 2), 1);
+        assert_eq!(batch_hint(0), BATCH);
     }
 }
