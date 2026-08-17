@@ -356,7 +356,8 @@ carried for the rest of the run, and only what remains disputable is retained �
 deposits only, since withdrawals are never recorded at all.
 
 All of this is measured rather than asserted — see [Benchmark](#benchmark) for a
-reproducible 1 GiB run of both the retention-heavy and the release-heavy case.
+reproducible 100-million-record run of both the retention-heavy and the release-heavy
+case.
 
 **On pre-sizing the client table.** `HashMap::with_capacity(u16::MAX)` reserves about
 13.7 MB of address space up front, which sounds worse than it is: only the 128 KB of
@@ -384,22 +385,55 @@ $ nix run .#bench-small      # 16 MiB (.tar.xz), what CI runs
 
 **The input is a derivation, not a file in `/tmp`.** Each profile is a store path built by
 `nix build .#bench-input`, which means Nix knows it exists, rebuilds it when it is
-missing, and `nix store gc` reclaims the gigabyte once nothing references it. An earlier
-version generated into `$TMPDIR` from the runner script, which left a gigabyte somewhere
+missing, and `nix store gc` reclaims the space once nothing references it. An earlier
+version generated into `$TMPDIR` from the runner script, which left gigabytes somewhere
 Nix could neither guarantee nor collect. The runner also times the **packaged** binary —
 the one `nix build` produces — rather than whatever a local `cargo` last left in
 `./target`.
+
+**And it is addressed by its content, which is what stops it regenerating.** Every input
+is a fixed-output derivation with its hash pinned in `nix/bench.nix`. A fixed-output
+derivation's store path is a function of its name and that hash and nothing else, so once
+the archive is in the store it is the archive Nix uses, however much of the repository
+has moved since.
+
+The alternative is worse than it sounds. An input-addressed derivation's path covers
+every build input, and the inputs here transitively included the whole working tree,
+because the archive is produced by a generator compiled from it. Editing the README
+regenerated 3 GB of CSV. So did editing the flake. Worst of all, so did
+`bench/history.jsonl` — which the runner appends to at the end of every run, meaning each
+benchmark invalidated the very input the next benchmark needed, and the 800 MB archive
+was rebuilt every single time. Four superseded copies had accumulated in the store before
+this was noticed. The generator's source is now narrowed to the files it actually
+compiles as well, so the ordinary edit does not even rebuild the generator.
 
 **Reproducible by construction.** `examples/generate_transactions.rs` carries its own
 SplitMix64 instead of depending on a random-number crate, whose stream is free to change
 between releases. The same seed produces byte-identical input on any machine, in any year,
 and a benchmark number is only comparable against another measured on the same bytes.
 
-That is enforced rather than asserted for the small profile: `bench-input-small` is a
-fixed-output derivation with its hash pinned in `nix/bench.nix`, so Nix verifies the bytes
-after generating them and CI fails if the generator ever stops being deterministic. The
-1 GiB inputs deliberately leave the hash off, so that changing the generator does not
-break the build with a hash mismatch on a file that takes a minute to rebuild.
+Compression had to be pinned down to keep that true, and not in the way first assumed.
+`xz`'s threaded encoder splits the stream into independently compressed blocks; its
+single-threaded encoder does not, and the two produce different bytes for the same input.
+`-T0` means "one thread per core", so the archive silently became a property of the
+builder's CPU count: on a one-core machine it would come out different and fail its hash.
+The fix is an explicit `-T4`. Measured on the small profile, `-T2`, `-T3`, `-T4`, `-T8` and
+`-T16` are byte-identical and only `-T1` differs — the thread count above one does not
+affect the output, it only decides how many cores race through the same work.
+
+`--block-size=16MiB` is there for a smaller reason: it states the block division outright
+rather than inheriting the value `xz` derives from the preset, so a future `xz` that
+changes that default cannot invalidate the pinned hashes. Contrary to what this paragraph
+claimed on first writing, the default block size is _not_ core-count dependent — measured,
+`-T2` through `-T16` agree without it too.
+
+**A pinned hash cuts both ways**, and the flake accounts for that. While the hashes hold,
+the archives are never rebuilt — so a change to the generator would go unnoticed and the
+benchmark would happily keep measuring superseded data. The
+`bench-input-reproducible` check is the counterweight: it is deliberately _input_-addressed,
+so it re-runs whenever the generator changes, and it regenerates 16 MiB and compares it
+against the pinned archive. A generator change that alters the bytes fails the build with
+a message telling you to update the hashes, instead of passing quietly.
 
 The generator emits _valid_ work rather than noise. A dispute always names a real,
 currently-undisputed deposit belonging to that same client, and a resolve or chargeback
@@ -419,40 +453,59 @@ froze every account early would stop measuring anything.
 
 ### Results
 
-1 GiB of input, 65,535 clients, release build, on 8 cores and 15 GB of RAM:
+100,000,000 records per profile, 65,535 clients, release build, on 8 cores and 15 GB of
+RAM:
 
-| Mix        | Records    | Wall   | Throughput               | Peak RSS | Rejected |
-| ---------- | ---------- | ------ | ------------------------ | -------- | -------- |
-| `balanced` | 34,531,441 | 26.7 s | 1.29M records/s, 40 MB/s | 762 MB   | 30,978   |
-| `settled`  | 40,589,904 | 31.9 s | 1.27M records/s, 34 MB/s | 257 MB   | 0        |
+| Mix        | Input  | Wall    | Throughput               | Peak RSS | Rejected |
+| ---------- | ------ | ------- | ------------------------ | -------- | -------- |
+| `balanced` | 3.0 GB | 74.4 s  | 1.34M records/s, 42 MB/s | 1.9 GB   | 30,978   |
+| `settled`  | 2.5 GB | 101.0 s | 0.99M records/s, 27 MB/s | 542 MB   | 0        |
 
-Three things worth reading out of that table.
+Both profiles carry exactly the same number of records, so per-record figures compare
+directly. The inputs differ in size only because reference rows — dispute, resolve,
+chargeback — carry no amount and are shorter.
 
-**The input is never held.** Both runs process a gigabyte; neither comes close to holding
-one. Peak memory tracks retained history, not file size.
+**The input is never held.** Neither run comes close to holding its three gigabytes. Peak
+memory tracks retained history, not file size.
 
-**Releasing settled records works.** `settled` processes 18% _more_ records than
-`balanced` in the same gigabyte, and peaks at a third of the memory, because a resolved
+**Releasing settled records works, and this is the robust result.** `settled` peaks at
+542 MB against 1.9 GB for the same 100 million records — 3.5× less — because a resolved
 transaction is dropped rather than carried. One honest caveat: `HashMap::remove` frees the
-entry but not the table's capacity, so 257 MB is the high-water mark of concurrently-open
+entry but not the table's capacity, so 542 MB is the high-water mark of concurrently-open
 records rather than the current count. Removal prevents growth; only locking an account
-returns memory outright, by dropping the whole map.
+returns memory outright, by dropping the whole map. This ratio has held across every
+measurement of these two mixes.
 
-**Per-record cost barely moves between the two.** 1.29M against 1.27M records per second,
-about 2% apart, even though `settled` spends two thirds of its records on dispute and
-resolve lookups where `balanced` mostly parses and adds. The gap in MB/s is much wider —
-40 against 34 — but that is a property of the input, not the engine: reference rows carry
-no amount, so they are shorter, and the same gigabyte holds 18% more of them. An earlier
-measurement put `settled` 16% slower per record; re-running it against the store-built
-input did not reproduce that, so the honest reading is that the two are close and the
-first number was noise.
+**Per-record cost is where the earlier version of this section was wrong.** At equal record
+counts `settled` runs 26% slower per record, not the ~2% this file previously claimed.
+That claim came from comparing two runs of equal _byte_ size, where `settled` fitted 18%
+more records into the same gigabyte and the difference cancelled out of the arithmetic. At
+equal record counts the gap is real: a dispute followed by a resolve is two hash lookups
+and two mutations against a table whose high-water capacity is never returned, where a
+deposit is one insert.
+
+**And the throughput figure is sensitive to how the bytes arrive**, which is worth knowing
+before reading too much into any of it. Three runs over byte-identical input, all three
+producing the identical output hash `fc21d7d3…`:
+
+| Delivery                                             | Wall   | Engine user CPU |
+| ---------------------------------------------------- | ------ | --------------- |
+| piped from the `xz -1` archive (what `.#bench` does) | 74.4 s | 72.5 s          |
+| piped from an `xz -6` archive                        | 93.2 s | 89.9 s          |
+| plain uncompressed file, no decompressor             | 94.5 s | 90.4 s          |
+
+A 27% spread on identical work. The obvious explanation — that the decompressor steals
+CPU — is contradicted by the third row, where nothing competes with the engine and it is
+the slowest of the three. No mechanism is claimed here; it has not been isolated. The
+operational conclusion is the one that matters: a throughput number is only comparable
+against another measured through the same delivery path, which is precisely what pinning
+the input as a fixed-output derivation and always piping it through `.#bench` gives you.
 
 The 30,978 rejections under `balanced` are almost all withdrawals refused for insufficient
 funds — the generator does not track balances, only references.
 
-The engine's own output is stable too: two runs over the same 1 GiB input produced the
-identical hash `80489f21…`, confirming that nothing about hash-map iteration order leaks
-into the result.
+The engine's own output is stable: every run over the same input produced the identical
+hash, confirming that nothing about hash-map iteration order leaks into the result.
 
 ### Metrics and history
 
@@ -608,8 +661,8 @@ The flake pins the toolchain, packages the engine, and carries the benchmark.
 | `nix build .#with-dispute-withdraw` | The same engine with withdrawal disputes compiled in.                                                                                                 |
 | `nix flake check`                   | Everything: both variants, the suite inside each, and the clippy, rustfmt and nixfmt checks. This is exactly what CI runs.                            |
 | `nix run . -- transactions.csv`     | Runs the packaged binary.                                                                                                                             |
-| `nix run .#bench`                   | The reproducible 1 GiB benchmark described below. `.#bench-settled` and `.#bench-small` are the other profiles.                                       |
-| `nix build .#bench-input`           | Builds a benchmark input as a store path. `.#bench-input-settled`, `.#bench-input-small` and `.#bench-generator` are the rest.                        |
+| `nix run .#bench`                   | The reproducible 100M-record benchmark described below. `.#bench-settled` and `.#bench-small` are the other profiles.                                 |
+| `nix build .#bench-input`           | Builds a benchmark input as a store path, once and for good. `.#bench-input-settled`, `.#bench-input-small` and `.#bench-generator` are the rest.     |
 | `nix develop`                       | Dev shell: the toolchain plus `cargo-nextest`, `cargo-mutants`, `cargo-deny` and the formatters.                                                      |
 | `nix run .#fmt`                     | Formats Rust, Nix, TOML and Markdown.                                                                                                                 |
 
@@ -623,18 +676,18 @@ CI runs everything through the flake, so there is no second definition of "green
 in sync: no rustup, no toolchain action, no separately pinned tool versions. `nix flake
 check` on a laptop gives the same answer as the pipeline, on the same compiler.
 
-| Job                  | What it runs                                                                                                         |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `nix flake check`    | Both variants built, the whole suite inside each derivation's check phase, and the clippy, rustfmt and nixfmt checks |
-| `cargo deny`         | Advisories, bans, licences and sources, through the dev shell                                                        |
-| Benchmark smoke test | The benchmark at 16 MiB                                                                                              |
+| Job                  | What it runs                                                                                                                                                    |
+| -------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `nix flake check`    | Both variants built, the whole suite inside each derivation's check phase, the clippy, rustfmt and nixfmt checks, and the benchmark-input reproducibility check |
+| `cargo deny`         | Advisories, bans, licences and sources, through the dev shell                                                                                                   |
+| Benchmark smoke test | The benchmark at 16 MiB                                                                                                                                         |
 
 Two deliberate exceptions. `cargo deny` runs through `nix develop` rather than as a flake
 check, because fetching the advisory database needs network access and a build sandbox has
 none — the version is still pinned by the flake. And the benchmark runs at 16 MiB rather
-than the 1 GiB default: that job exists to catch the generator or the benchmark wiring
-rotting, not to measure anything. A shared runner has far too much variance for the number
-to mean much, so the real 1 GiB run belongs on a known machine.
+than the 100M-record default: that job exists to catch the generator or the benchmark
+wiring rotting, not to measure anything. A shared runner has far too much variance for the
+number to mean much, so the real run belongs on a known machine.
 
 Clippy is invoked twice, with and without `--all-features`, because `--all-features` alone
 would only ever lint the configuration where withdrawal disputes are compiled in.

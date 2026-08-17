@@ -24,17 +24,21 @@ let
     rustc = rustToolchain;
   };
 
-  src = lib.cleanSourceWith {
-    src = ../.;
-    filter =
-      path: type:
-      let
-        name = baseNameOf (toString path);
-      in
-      name != "target"
-      && name != "mutants.out"
-      && name != "coding_challenge.md"
-      && lib.cleanSourceFilter path type;
+  # A whitelist, not an exclude-list. The package's store path is a hash of everything in
+  # here, so anything included that the compiler never reads is a spurious rebuild waiting
+  # to happen. Under the old exclude-list filter, appending a line to bench/history.jsonl
+  # rebuilt the engine — and the benchmark runner appends one at the end of every run, so
+  # two consecutive benchmarks were never timing the same binary.
+  src = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions [
+      ../Cargo.toml
+      ../Cargo.lock
+      ../.cargo
+      ../src
+      ../tests
+      ../examples
+    ];
   };
 
   cargoLock.lockFile = ../Cargo.lock;
