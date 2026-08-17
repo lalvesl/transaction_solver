@@ -87,10 +87,42 @@
         };
 
         # `nix build` runs the test suite in the derivation's check phase, so this is the
-        # whole suite, hermetically, on the pinned toolchain.
+        # whole suite, hermetically, on the pinned toolchain. CI runs exactly this, which
+        # is the point: `nix flake check` locally gives the same answer as the pipeline.
         checks = {
           default = transactionSolver;
           with-dispute-withdraw = package { features = [ "dispute-withdraw" ]; };
+
+          # Lints both configurations. `--all-features` on its own would only ever check
+          # the one where withdrawal disputes are compiled in.
+          clippy = rustPlatform.buildRustPackage {
+            pname = "transaction-solver-clippy";
+            version = "0.1.0";
+            inherit src;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = [ rustToolchain ];
+            buildPhase = ''
+              runHook preBuild
+              cargo clippy --all-targets -- -D warnings
+              cargo clippy --all-targets --all-features -- -D warnings
+              runHook postBuild
+            '';
+            doCheck = false;
+            installPhase = "touch $out";
+          };
+
+          # `rustfmt` directly rather than `cargo fmt`: the latter shells out to
+          # `cargo metadata`, which wants to resolve the dependency graph, and a build
+          # sandbox has no network.
+          rustfmt = pkgs.runCommand "check-rustfmt" { nativeBuildInputs = [ rustToolchain ]; } ''
+            find ${src} -name '*.rs' -exec rustfmt --check --edition 2021 {} +
+            touch $out
+          '';
+
+          nixfmt = pkgs.runCommand "check-nixfmt" { nativeBuildInputs = [ pkgs.nixfmt ]; } ''
+            nixfmt --check ${src}/flake.nix
+            touch $out
+          '';
         };
 
         devShells.default = pkgs.mkShell {
