@@ -377,9 +377,9 @@ the specification asks about, and at this size a single-pass engine is the bette
 ## Benchmark
 
 ```console
-$ nix run .#bench            # 1 GiB, balanced
-$ nix run .#bench-settled    # 1 GiB, settled
-$ nix run .#bench-small      # 16 MiB, what CI runs
+$ nix run .#bench            # 100,000,000 records (.tar.xz), balanced
+$ nix run .#bench-settled    # 100,000,000 records (.tar.xz), settled
+$ nix run .#bench-small      # 16 MiB (.tar.xz), what CI runs
 ```
 
 **The input is a derivation, not a file in `/tmp`.** Each profile is a store path built by

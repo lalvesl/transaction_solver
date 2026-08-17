@@ -44,3 +44,26 @@
   "accounts": 65535,
   "rejected": 0
 }
+{
+  "timestamp": "2026-08-17T02:19:30Z",
+  "commit": "ae7d2f5",
+  "input": "/nix/store/3js51g2dnd73bv9apl4skg3vkj6v5x16-transactions-balanced-16MiB.tar.xz",
+  "output_sha256": "dfab7d9845d564f132ea059757d851be3e0e33c8888946b826fa94a0ef25c8d1",
+  "kernel": "6.18.38",
+  "cpus": 8,
+  "input_bytes": 15864012,
+  "records": 588211,
+  "wall_s": 0.62,
+  "user_s": 0.55,
+  "sys_s": 0.02,
+  "cpu_pct": 93,
+  "peak_rss_kb": 11972,
+  "major_faults": 0,
+  "minor_faults": 2494,
+  "voluntary_switches": 6,
+  "involuntary_switches": 918,
+  "records_per_s": 948727,
+  "mb_per_s": 25.6,
+  "accounts": 256,
+  "rejected": 141
+}

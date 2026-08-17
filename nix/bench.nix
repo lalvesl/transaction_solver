@@ -45,16 +45,24 @@ let
   # that a change to the generator does not fail the build with a hash mismatch.
   input =
     {
-      bytes,
+      bytes ? null,
+      records ? null,
       mix ? "balanced",
       clients ? 65535,
       seed ? 20260816,
       hash ? null,
     }:
-    pkgs.runCommand "transactions-${mix}-${bytes}.csv"
+    let
+      tag = if records != null then "${toString records}rec" else bytes;
+    in
+    pkgs.runCommand "transactions-${mix}-${tag}.tar.xz"
       (
         {
-          nativeBuildInputs = [ generator ];
+          nativeBuildInputs = [
+            generator
+            pkgs.gnutar
+            pkgs.xz
+          ];
         }
         // lib.optionalAttrs (hash != null) {
           outputHashAlgo = "sha256";
@@ -65,20 +73,24 @@ let
       ''
         generate-transactions \
           --seed ${toString seed} \
-          --bytes ${bytes} \
+          ${lib.optionalString (bytes != null) "--bytes ${bytes}"} \
+          ${lib.optionalString (records != null) "--records ${toString records}"} \
           --clients ${toString clients} \
-          --mix ${mix} > $out
+          --mix ${mix} > transactions.csv
+
+        tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner -cJf $out transactions.csv
+        rm transactions.csv
       '';
 
-  large = input { bytes = "1GiB"; };
+  large = input { records = 100000000; };
   settled = input {
-    bytes = "1GiB";
+    records = 100000000;
     mix = "settled";
   };
   small = input {
     bytes = "16MiB";
     clients = 256;
-    hash = "sha256-NKSsciXwnlZkmPtO32cIbjee8chIvoUr9/WRB2MvhEE=";
+    hash = "sha256-U4Ppr7mW16+b7Zhpz7x8WSnApfI8HOrVdEDtQkUqBKc=";
   };
 
   # Times the packaged engine — the same binary `nix build` produces, not whatever a
@@ -97,6 +109,8 @@ let
         gawk
         jq
         git
+        gnutar
+        xz
       ];
       text = ''
         input="${source}"
@@ -106,17 +120,18 @@ let
         work="$(mktemp -d)"
         trap 'rm -rf "$work"' EXIT
 
-        input_bytes="$(stat -L -c %s "$input")"
-        input_records="$(( $(wc -l < "$input") - 1 ))"
+        archive_bytes="$(stat -L -c %s "$input")"
+        read -r input_records input_bytes < <(tar -xOf "$input" | wc -l -c)
+        input_records=$(( input_records - 1 ))
 
-        printf '\n  input     %s, %s records\n' \
-          "$(numfmt --to=iec "$input_bytes")" "$input_records"
+        printf '\n  input     %s uncompressed (%s compressed), %s records\n' \
+          "$(numfmt --to=iec "$input_bytes")" "$(numfmt --to=iec "$archive_bytes")" "$input_records"
         printf '  from      %s\n' "$input"
 
         # %e wall, %U user, %S sys, %P cpu%, %M peak RSS KiB, %F major faults,
         # %R minor faults, %w voluntary switches, %c involuntary switches.
-        command time -o "$work/timing" -f '%e %U %S %P %M %F %R %w %c' \
-          ${lib.getExe rust.transactionSolver} "$input" \
+        tar -xOf "$input" | command time -o "$work/timing" -f '%e %U %S %P %M %F %R %w %c' \
+          ${lib.getExe rust.transactionSolver} \
           > "$work/accounts.csv" 2> "$work/rejected.log"
         read -r wall user sys cpu rss majflt minflt volcsw involcsw < "$work/timing"
         cpu="''${cpu%\%}"

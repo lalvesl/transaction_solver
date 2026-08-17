@@ -35,8 +35,12 @@ const SCALE: u64 = 10_000;
 #[command(about = "Generate a reproducible transaction log for benchmarking")]
 struct Args {
     /// Target size. Accepts a plain byte count or a suffix: 512MiB, 1GiB, 2GB.
-    #[arg(long, default_value = "1GiB", value_parser = parse_size)]
-    bytes: u64,
+    #[arg(long, value_parser = parse_size)]
+    bytes: Option<u64>,
+
+    /// Target number of records.
+    #[arg(long)]
+    records: Option<u64>,
 
     /// Seed. The same seed and arguments always produce the same bytes.
     #[arg(long, default_value_t = 0x5EED_C0DE_1234_5678)]
@@ -127,6 +131,11 @@ fn generate<W: Write>(args: &Args, out: &mut W) -> io::Result<Summary> {
     let mut rng = SplitMix64::new(args.seed);
     let mut clients = vec![ClientState::default(); args.clients as usize];
 
+    let (target_bytes, target_records) = match (args.bytes, args.records) {
+        (None, None) => (Some(1 << 30), None),
+        other => other,
+    };
+
     let mut row = String::with_capacity(64);
     let mut next_tx: u32 = 1;
     let mut records = 0;
@@ -136,7 +145,7 @@ fn generate<W: Write>(args: &Args, out: &mut W) -> io::Result<Summary> {
     out.write_all(HEADER.as_bytes())?;
     let mut bytes = HEADER.len() as u64;
 
-    while bytes < args.bytes {
+    while target_bytes.map_or(true, |b| bytes < b) && target_records.map_or(true, |r| records < r) {
         // Every client charged back, or transaction IDs exhausted: nothing left to emit.
         if frozen == clients.len() || next_tx == u32::MAX {
             break;
