@@ -46,10 +46,22 @@
           default = rust.transactionSolver;
           with-dispute-withdraw = rust.withDisputeWithdraw;
 
-          nixfmt = pkgs.runCommand "check-nixfmt" { nativeBuildInputs = [ pkgs.nixfmt ]; } ''
-            find ${rust.src} -name '*.nix' -exec nixfmt --check {} +
-            touch $out
-          '';
+          # Its own source: rust.src is narrowed to what the compiler reads, which is
+          # deliberately not the Nix files.
+          nixfmt =
+            let
+              nixSrc = pkgs.lib.fileset.toSource {
+                root = ./.;
+                fileset = pkgs.lib.fileset.unions [
+                  ./flake.nix
+                  ./nix
+                ];
+              };
+            in
+            pkgs.runCommand "check-nixfmt" { nativeBuildInputs = [ pkgs.nixfmt ]; } ''
+              find ${nixSrc} -name '*.nix' -exec nixfmt --check {} +
+              touch $out
+            '';
         }
         // rust.checks
         // bench.checks;
