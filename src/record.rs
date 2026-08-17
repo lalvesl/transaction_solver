@@ -49,6 +49,21 @@ pub enum Transaction {
 }
 
 impl Transaction {
+    /// The client this transaction belongs to.
+    ///
+    /// Every variant carries one, which is what makes the whole workload partitionable:
+    /// no transaction can reach across clients ([D4](../README.md)), so routing by this
+    /// value gives each shard a set of accounts nothing else can touch.
+    pub fn client(&self) -> u16 {
+        match *self {
+            Self::Deposit { client, .. }
+            | Self::Withdrawal { client, .. }
+            | Self::Dispute { client, .. }
+            | Self::Resolve { client, .. }
+            | Self::Chargeback { client, .. } => client,
+        }
+    }
+
     /// Validates a raw row.
     ///
     /// Types are matched case-insensitively. The specification only ever writes them in

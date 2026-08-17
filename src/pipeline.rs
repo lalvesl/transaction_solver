@@ -10,12 +10,101 @@ use crate::{
     record::{RawRecord, Transaction},
 };
 
+/// A validated record and the input line it came from.
+///
+/// The line number travels with the transaction because the place that rejects a record is
+/// no longer the place that read it: under [`crate::parallel`] the record has crossed a
+/// channel into another thread by then, and a diagnostic that cannot name its line is
+/// close to useless.
+#[derive(Debug)]
+pub struct Entry {
+    pub line: u64,
+    pub transaction: Transaction,
+}
+
+/// One step of the reader.
+#[derive(Debug)]
+pub enum Reading {
+    /// A record that parsed and validated. It may still be refused by the engine.
+    Ready(Entry),
+    /// A record that never got as far as the engine.
+    Rejected { line: u64, error: RecordError },
+}
+
+/// Pulls validated records off a CSV stream.
+///
+/// Records are read one at a time into a reusable buffer, so the input is never held in
+/// memory: peak usage is a function of the engine's state, not of the file's size.
+///
+/// Splitting this out of [`run`] is what lets the same parser feed either a single engine
+/// or a fan of sharded ones — the two differ in where a record goes, not in how it is read.
+pub struct Reader<R: Read> {
+    csv: csv::Reader<R>,
+    headers: StringRecord,
+    record: StringRecord,
+}
+
+impl<R: Read> Reader<R> {
+    /// Opens the stream and reads its header row.
+    pub fn new(reader: R) -> Result<Self, FatalError> {
+        let mut csv = ReaderBuilder::new()
+            // Whitespace around any field, including the header, must be tolerated.
+            .trim(Trim::All)
+            // A row may legitimately omit the trailing amount column entirely.
+            .flexible(true)
+            .from_reader(reader);
+
+        let headers = csv.headers().map_err(FatalError::Read)?.clone();
+
+        Ok(Self {
+            csv,
+            headers,
+            record: StringRecord::new(),
+        })
+    }
+
+    /// The next record, or `None` at the end of the stream.
+    ///
+    /// Only losing the stream itself is an error here. A record that cannot be parsed is
+    /// the partner's mistake, like any other bad record, and comes back as
+    /// [`Reading::Rejected`].
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Reading>, FatalError> {
+        match self.csv.read_record(&mut self.record) {
+            Ok(false) => Ok(None),
+            Ok(true) => {
+                let line = self.record.position().map_or(0, |position| position.line());
+
+                Ok(Some(match self.parse() {
+                    Ok(transaction) => Reading::Ready(Entry { line, transaction }),
+                    Err(error) => Reading::Rejected { line, error },
+                }))
+            }
+            Err(error) if error.is_io_error() => Err(FatalError::Read(error)),
+            Err(error) => {
+                let line = error.position().map_or(0, |position| position.line());
+                Ok(Some(Reading::Rejected {
+                    line,
+                    error: RecordError::Malformed(error),
+                }))
+            }
+        }
+    }
+
+    fn parse(&self) -> Result<Transaction, RecordError> {
+        let raw: RawRecord<'_> = self
+            .record
+            .deserialize(Some(&self.headers))
+            .map_err(RecordError::Malformed)?;
+
+        Transaction::from_raw(&raw)
+    }
+}
+
 /// Reads every record from `reader` and applies it to `engine`.
 ///
-/// Records are pulled one at a time into a reusable buffer, so the input is never held in
-/// memory: peak usage is a function of the engine's state, not of the file's size. The
-/// output cannot be streamed in the same way — a dispute on the final line can still move
-/// an account touched on the first — so nothing is written until the input is exhausted.
+/// The single-threaded path: one engine, records applied in input order, diagnostics in
+/// input order too. [`crate::parallel`] is the same work spread over shards.
 ///
 /// Rejected records are reported to `diagnostics` and counted; only an I/O failure stops
 /// the run.
@@ -24,51 +113,25 @@ pub fn run<R: Read, W: Write>(
     engine: &mut Engine,
     diagnostics: &mut W,
 ) -> Result<u64, FatalError> {
-    let mut csv = ReaderBuilder::new()
-        // Whitespace around any field, including the header, must be tolerated.
-        .trim(Trim::All)
-        // A row may legitimately omit the trailing amount column entirely.
-        .flexible(true)
-        .from_reader(reader);
-
-    let headers = csv.headers().map_err(FatalError::Read)?.clone();
-    let mut record = StringRecord::new();
+    let mut reader = Reader::new(reader)?;
     let mut rejected = 0;
 
-    loop {
-        match csv.read_record(&mut record) {
-            Ok(false) => break,
-            Ok(true) => {
-                if let Err(error) = apply(&headers, &record, engine) {
-                    let line = record.position().map_or(0, |position| position.line());
-                    report(diagnostics, line, &error);
+    while let Some(reading) = reader.next()? {
+        match reading {
+            Reading::Ready(entry) => {
+                if let Err(error) = engine.apply(entry.transaction) {
+                    report(diagnostics, entry.line, &error);
                     rejected += 1;
                 }
             }
-            // A record we cannot even parse is the partner's error, like any other bad
-            // record. Losing the input stream itself is not.
-            Err(error) if error.is_io_error() => return Err(FatalError::Read(error)),
-            Err(error) => {
-                let line = error.position().map_or(0, |position| position.line());
-                report(diagnostics, line, &RecordError::Malformed(error));
+            Reading::Rejected { line, error } => {
+                report(diagnostics, line, &error);
                 rejected += 1;
             }
         }
     }
 
     Ok(rejected)
-}
-
-fn apply(
-    headers: &StringRecord,
-    record: &StringRecord,
-    engine: &mut Engine,
-) -> Result<(), RecordError> {
-    let raw: RawRecord<'_> = record
-        .deserialize(Some(headers))
-        .map_err(RecordError::Malformed)?;
-
-    engine.apply(Transaction::from_raw(&raw)?)
 }
 
 /// Reports a rejected record. A failing diagnostics stream must not take the run down

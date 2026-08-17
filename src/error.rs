@@ -78,4 +78,12 @@ pub enum FatalError {
 
     #[error("cannot write the output")]
     Write(#[source] csv::Error),
+
+    #[error("cannot start the worker runtime")]
+    Runtime(#[source] std::io::Error),
+
+    /// The reader thread unwound. Nothing downstream can be trusted to be complete, so
+    /// this is reported rather than quietly returning a short result.
+    #[error("the input reader stopped unexpectedly")]
+    ReaderPanicked,
 }

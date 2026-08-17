@@ -28,7 +28,25 @@ fn stderr_of(output: &Output) -> &str {
     std::str::from_utf8(&output.stderr).expect("diagnostics should be UTF-8")
 }
 
-/// Runs `<name>.csv` and compares stdout with its golden file.
+/// The header and the data rows of a CSV, with the rows sorted.
+///
+/// Accounts are written as they finish, and shards finish concurrently, so row order is
+/// whatever the scheduler produced on the day. The specification says row order is
+/// irrelevant; what has to hold is that the same set of accounts comes out with the same
+/// numbers. Sorting here compares exactly that, and nothing that is not a guarantee.
+#[track_caller]
+fn rows(csv: &str) -> (String, Vec<String>) {
+    let mut lines = csv.lines();
+    let header = lines.next().unwrap_or_default().to_owned();
+    let mut rows: Vec<String> = lines
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    rows.sort();
+    (header, rows)
+}
+
+/// Runs `<name>.csv` and compares stdout with its golden file, as a set of rows.
 #[track_caller]
 fn check(name: &str) -> Output {
     let input = data_dir().join(format!("{name}.csv"));
@@ -50,13 +68,51 @@ fn check(name: &str) -> Output {
         stderr_of(&output)
     );
     assert_eq!(
-        stdout_of(&output),
-        expected,
+        rows(stdout_of(&output)),
+        rows(&expected),
         "{name} does not match {}",
         golden.display()
     );
 
     output
+}
+
+/// Runs a case at several shard counts and requires the same answer from each.
+///
+/// One shard is the sharding switched off; the others split the same clients different
+/// ways. A rule that only holds when a client's records all land on one engine would show
+/// up here as a disagreement.
+#[track_caller]
+fn check_across_shards(name: &str) {
+    let input = data_dir().join(format!("{name}.csv"));
+
+    let baseline = Command::new(env!("CARGO_BIN_EXE_transaction_solver"))
+        .arg("--shards")
+        .arg("1")
+        .arg(&input)
+        .output()
+        .expect("the binary should be runnable");
+    let expected = rows(stdout_of(&baseline));
+
+    for shards in ["2", "3", "7", "16"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_transaction_solver"))
+            .arg("--shards")
+            .arg(shards)
+            .arg(&input)
+            .output()
+            .expect("the binary should be runnable");
+
+        assert!(
+            output.status.success(),
+            "{name} at {shards} shards should exit successfully, stderr:\n{}",
+            stderr_of(&output)
+        );
+        assert_eq!(
+            rows(stdout_of(&output)),
+            expected,
+            "{name} at {shards} shards disagrees with the single-shard run"
+        );
+    }
 }
 
 #[test]
@@ -183,7 +239,7 @@ fn reads_from_stdin_when_no_argument_given() {
         "should exit successfully, stderr:\n{}",
         stderr_of(&output)
     );
-    assert_eq!(stdout_of(&output), expected);
+    assert_eq!(rows(stdout_of(&output)), rows(&expected));
 }
 
 #[test]
@@ -212,5 +268,50 @@ fn reads_from_stdin_when_dash_argument_given() {
         "should exit successfully, stderr:\n{}",
         stderr_of(&output)
     );
-    assert_eq!(stdout_of(&output), expected);
+    assert_eq!(rows(stdout_of(&output)), rows(&expected));
+}
+
+/// The property that makes sharding legitimate: how the clients are split cannot change
+/// the answer. Every sample, at five different splits.
+#[test]
+fn the_shard_count_never_changes_the_result() {
+    for name in [
+        "spec_example",
+        "dispute_lifecycle",
+        "locked_account",
+        "partner_errors",
+        "precision",
+        "reversal_after_spend",
+        "whitespace",
+        "withdrawal_dispute",
+    ] {
+        check_across_shards(name);
+    }
+}
+
+/// Every client is reported exactly once, whether its account froze mid-run and was
+/// evicted or survived to the drain at the end. Getting this wrong is the obvious way an
+/// eviction scheme breaks: the row goes out twice, or not at all.
+#[test]
+fn a_frozen_client_is_reported_once_and_only_once() {
+    let output = solve(&data_dir().join("locked_account.csv"));
+    let (_, written) = rows(stdout_of(&output));
+
+    let mut clients: Vec<&str> = written
+        .iter()
+        .map(|row| row.split(',').next().unwrap_or_default())
+        .collect();
+    let before = clients.len();
+    clients.sort_unstable();
+    clients.dedup();
+
+    assert_eq!(
+        before,
+        clients.len(),
+        "a client was written twice: {written:?}"
+    );
+    assert!(
+        written.iter().any(|row| row.ends_with(",true")),
+        "this sample is meant to freeze an account: {written:?}"
+    );
 }
