@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the previous run redundant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  flake-check:
+    name: nix flake check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Builds both feature variants, runs the whole test suite inside each
+      # derivation's check phase, and runs the clippy, rustfmt and nixfmt checks.
+      # This is the same command a developer runs locally, so CI cannot disagree
+      # with a clean working copy about whether the tree is green.
+      - name: Build, test and lint on the pinned toolchain
+        run: nix flake check --print-build-logs
+
+  supply-chain:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # Deliberately not a flake check: fetching the advisory database needs
+      # network access, and a build sandbox has none. The dev shell supplies
+      # cargo-deny, so the version used here is still pinned by the flake.
+      - name: Advisories, bans, licences and sources
+        run: nix develop --command cargo deny check
+
+  benchmark-smoke:
+    name: benchmark smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      # 16 MiB rather than the 1 GiB default. The point is to prove the generator
+      # and the benchmark wiring still work, not to measure anything: a shared CI
+      # runner has too much variance to produce a number worth comparing, and the
+      # real 1 GiB run belongs on a known machine.
+      - name: Generate and process a small input
+        env:
+          BYTES: 16MiB
+          CLIENTS: "256"
+        run: nix run .#bench
